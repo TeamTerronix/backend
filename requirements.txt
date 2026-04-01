@@ -1,0 +1,22 @@
+# API
+fastapi>=0.104.0
+uvicorn>=0.24.0
+pydantic>=2.0.0
+python-multipart>=0.0.6
+
+# Data and inference
+pandas>=2.0.0
+numpy>=1.24.0
+tensorflow>=2.13.0
+scipy>=1.7.0
+
+# Database
+sqlalchemy>=2.0.0
+psycopg[binary]>=3.2.0
+
+# Auth
+python-jose[cryptography]>=3.3.0
+passlib[bcrypt]>=1.7.4
+
+# Scheduling
+apscheduler>=3.10.0
