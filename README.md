@@ -81,6 +81,22 @@ Run once after setting `DATABASE_URL`:
 python create_tables.py
 ```
 
+## 5b. (Schema updates) Run migrations scripts when needed
+
+If you pull changes that add new columns (example: `network_group_id`), run:
+
+```bash
+python migrate_add_network_group_id.py
+```
+
+## 5a. (Optional) Seed the Database with Test Data
+
+If you want test users/sensors/readings/predictions in your PostgreSQL DB for dashboard testing:
+
+```bash
+python seed_data.py
+```
+
 ## 6. Run the API
 
 ```bash

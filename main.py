@@ -7,14 +7,15 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
-import numpy as np
 import os
 import pandas as pd
+import uuid
 
 from fastapi import Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 
@@ -30,7 +31,7 @@ from auth import (
     verify_password,
 )
 from database import SessionLocal, get_db
-from models import Prediction, Sensor, SensorReading, User, UserRole
+from models import Prediction, Sensor, SensorReading, User, UserRole, NetworkGroup, UserNetworkGroup
 from scheduler import create_scheduler
 
 
@@ -46,20 +47,20 @@ class AlertConnectionManager:
     """
 
     def __init__(self) -> None:
-        self._connections: dict[WebSocket, tuple[int, str]] = {}  # ws -> (user_id, role)
+        self._connections: dict[WebSocket, tuple[int, str, set[str]]] = {}  # ws -> (user_id, role, network_ids)
 
-    async def connect(self, ws: WebSocket, user: User) -> None:
+    async def connect(self, ws: WebSocket, user: User, network_ids: list[str]) -> None:
         await ws.accept()
-        self._connections[ws] = (user.id, user.role.value)
+        self._connections[ws] = (user.id, user.role.value, set(network_ids))
 
     def disconnect(self, ws: WebSocket) -> None:
         self._connections.pop(ws, None)
 
-    async def broadcast_alert(self, alert: dict, owner_id: Optional[int]) -> None:
-        """Send alert to the sensor's owner and all admin connections."""
+    async def broadcast_alert(self, alert: dict, network_group_id: Optional[str]) -> None:
+        """Send alert to all users in the network group and all admins."""
         dead: list[WebSocket] = []
-        for ws, (uid, role) in self._connections.items():
-            if role == "admin" or uid == owner_id:
+        for ws, (uid, role, network_ids) in self._connections.items():
+            if role == "admin" or (network_group_id is not None and network_group_id in network_ids):
                 try:
                     await ws.send_json(alert)
                 except Exception:
@@ -69,6 +70,17 @@ class AlertConnectionManager:
 
 
 manager = AlertConnectionManager()
+
+def _user_network_ids(db: Session, user: User) -> list[str]:
+    if user.role == UserRole.admin:
+        # caller should not use this for admin filtering, but keep safe
+        return []
+    rows = (
+        db.query(UserNetworkGroup.network_group_id)
+        .filter(UserNetworkGroup.user_id == user.id)
+        .all()
+    )
+    return [r[0] for r in rows if r and r[0]]
 
 
 # ── Lifespan: start/stop the background scheduler ─────────────────────────────
@@ -87,10 +99,16 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+
 # CORS for Next.js dev server
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:3001",
+        "http://127.0.0.1:3001",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -159,20 +177,91 @@ def health():
 
 
 @app.get("/api/stats", response_model=StatsResponse)
-def get_stats():
-    df_sst = load_sst()
-    df_dhw = load_dhw()
-    df_pred = load_predictions()
+def get_stats(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Dashboard stats sourced from the database.
+
+    Notes:
+    - total_dhw_records is kept for backward compatibility with the frontend but
+      is not stored in the DB currently.
+    """
+    if current_user.role == UserRole.admin:
+        readings_count = db.query(func.count(SensorReading.id)).scalar() or 0
+        predictions_count = db.query(func.count(Prediction.id)).scalar() or 0
+        min_ts, max_ts = db.query(
+            func.min(SensorReading.timestamp),
+            func.max(SensorReading.timestamp),
+        ).one()
+        unique_coords = (
+            db.query(func.count())
+            .select_from(
+                db.query(Sensor.latitude, Sensor.longitude)
+                .filter(Sensor.latitude.isnot(None), Sensor.longitude.isnot(None))
+                .distinct()
+                .subquery()
+            )
+            .scalar()
+            or 0
+        )
+    else:
+        network_ids = _user_network_ids(db, current_user)
+        if not network_ids:
+            return StatsResponse(
+                total_sst_records=0,
+                total_dhw_records=0,
+                total_predictions=0,
+                date_range={"start": None, "end": None},
+                unique_coordinates=0,
+            )
+
+        readings_count = (
+            db.query(func.count(SensorReading.id))
+            .join(Sensor, Sensor.id == SensorReading.sensor_id)
+            .filter(Sensor.network_group_id.in_(network_ids))
+            .scalar()
+            or 0
+        )
+        predictions_count = (
+            db.query(func.count(Prediction.id))
+            .join(Sensor, Sensor.id == Prediction.sensor_id)
+            .filter(Sensor.network_group_id.in_(network_ids))
+            .scalar()
+            or 0
+        )
+        min_ts, max_ts = (
+            db.query(func.min(SensorReading.timestamp), func.max(SensorReading.timestamp))
+            .join(Sensor, Sensor.id == SensorReading.sensor_id)
+            .filter(Sensor.network_group_id.in_(network_ids))
+            .one()
+        )
+        unique_coords = (
+            db.query(func.count())
+            .select_from(
+                db.query(Sensor.latitude, Sensor.longitude)
+                .filter(
+                    Sensor.network_group_id.in_(network_ids),
+                    Sensor.latitude.isnot(None),
+                    Sensor.longitude.isnot(None),
+                )
+                .distinct()
+                .subquery()
+            )
+            .scalar()
+            or 0
+        )
 
     return StatsResponse(
-        total_sst_records=len(df_sst),
-        total_dhw_records=len(df_dhw),
-        total_predictions=len(df_pred),
+        total_sst_records=int(readings_count),
+        total_dhw_records=0,
+        total_predictions=int(predictions_count),
         date_range={
-            "start": str(df_sst["time"].min()),
-            "end": str(df_sst["time"].max()),
+            "start": min_ts.isoformat() if min_ts else None,
+            "end": max_ts.isoformat() if max_ts else None,
         },
-        unique_coordinates=df_sst.groupby(["latitude", "longitude"]).ngroups,
+        unique_coordinates=int(unique_coords),
     )
 
 
@@ -181,14 +270,51 @@ def get_sst(
     start: Optional[str] = Query(None, description="Start date ISO format"),
     end: Optional[str] = Query(None, description="End date ISO format"),
     limit: int = Query(1000, ge=1, le=10000),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
-    df = load_sst()
+    """
+    Return sensor readings joined with sensor coordinates.
+
+    Response shape is aligned with the old CSV-backed endpoint:
+    - time, latitude, longitude, temperature
+    """
+    q = (
+        db.query(
+            SensorReading.timestamp.label("time"),
+            Sensor.sensor_uid.label("sensor_uid"),
+            Sensor.id.label("sensor_id"),
+            Sensor.latitude.label("latitude"),
+            Sensor.longitude.label("longitude"),
+            SensorReading.temperature.label("temperature"),
+        )
+        .join(Sensor, Sensor.id == SensorReading.sensor_id)
+        .filter(Sensor.latitude.isnot(None), Sensor.longitude.isnot(None))
+        .order_by(SensorReading.timestamp.desc())
+    )
+    if current_user.role != UserRole.admin:
+        network_ids = _user_network_ids(db, current_user)
+        if not network_ids:
+            return []
+        q = q.filter(Sensor.network_group_id.in_(network_ids))
+
     if start:
-        df = df[df["time"] >= pd.to_datetime(start)]
+        q = q.filter(SensorReading.timestamp >= pd.to_datetime(start))
     if end:
-        df = df[df["time"] <= pd.to_datetime(end)]
-    df = df.head(limit)
-    return df.to_dict(orient="records")
+        q = q.filter(SensorReading.timestamp <= pd.to_datetime(end))
+
+    rows = q.limit(limit).all()
+    return [
+        {
+            "time": r.time.isoformat(),
+            "sensor_uid": r.sensor_uid,
+            "sensor_id": r.sensor_id,
+            "latitude": r.latitude,
+            "longitude": r.longitude,
+            "temperature": r.temperature,
+        }
+        for r in rows
+    ]
 
 
 @app.get("/api/dhw")
@@ -196,26 +322,81 @@ def get_dhw(
     start: Optional[str] = Query(None),
     end: Optional[str] = Query(None),
     limit: int = Query(1000, ge=1, le=10000),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
-    df = load_dhw()
+    """
+    Degree Heating Weeks (DHW) is not stored in the database yet.
+
+    For now this endpoint derives a simple rolling heat-stress proxy from readings:
+    - hotspot = max(0, temperature - 30.0)
+    - dhw = 7-day rolling sum of hotspot / 7
+
+    This keeps the endpoint functional for the dashboard while you decide on the
+    exact DHW definition/climatology you want to persist.
+    """
+    q = (
+        db.query(SensorReading.timestamp, SensorReading.temperature)
+        .join(Sensor, Sensor.id == SensorReading.sensor_id)
+        .order_by(SensorReading.timestamp.asc())
+    )
+    if current_user.role != UserRole.admin:
+        network_ids = _user_network_ids(db, current_user)
+        if not network_ids:
+            return []
+        q = q.filter(Sensor.network_group_id.in_(network_ids))
     if start:
-        df = df[df["time"] >= pd.to_datetime(start)]
+        q = q.filter(SensorReading.timestamp >= pd.to_datetime(start))
     if end:
-        df = df[df["time"] <= pd.to_datetime(end)]
-    df = df.head(limit)
-    return df.to_dict(orient="records")
+        q = q.filter(SensorReading.timestamp <= pd.to_datetime(end))
+    rows = q.limit(limit).all()
+
+    if not rows:
+        return []
+
+    df = pd.DataFrame([{"time": r.timestamp, "temperature": r.temperature} for r in rows])
+    df["time"] = pd.to_datetime(df["time"], utc=True)
+    df = df.sort_values("time")
+    df["hotspot"] = (df["temperature"] - 30.0).clip(lower=0.0)
+    df["dhw"] = df["hotspot"].rolling(window=24 * 7, min_periods=1).sum() / 7.0
+    return [
+        {"time": t.isoformat(), "dhw": float(v)}
+        for t, v in zip(df["time"].tolist(), df["dhw"].tolist())
+    ]
 
 
 @app.get("/api/predictions")
 def get_predictions(
     min_risk: float = Query(0.0, ge=0.0, le=1.0),
     limit: int = Query(500, ge=1, le=5000),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
-    df = load_predictions()
+    q = db.query(Prediction).order_by(Prediction.target_timestamp.asc())
+    if current_user.role != UserRole.admin:
+        network_ids = _user_network_ids(db, current_user)
+        if not network_ids:
+            return []
+        q = q.join(Sensor, Sensor.id == Prediction.sensor_id).filter(
+            Sensor.network_group_id.in_(network_ids)
+        )
     if min_risk > 0:
-        df = df[df["risk_score"] >= min_risk]
-    df = df.head(limit)
-    return df.to_dict(orient="records")
+        q = q.filter(Prediction.risk_score.isnot(None), Prediction.risk_score >= min_risk)
+    items = q.limit(limit).all()
+    return [
+        {
+            "sensor_id": p.sensor_id,
+            "target_timestamp": p.target_timestamp.isoformat(),
+            "predicted_temp": p.predicted_temp,
+            "risk_level": p.risk_level,
+            "risk_score": p.risk_score,
+            "anomaly": p.anomaly,
+            "days_stressed": p.days_stressed,
+            "warming_rate": p.warming_rate,
+            "physics_residual": p.physics_residual,
+        }
+        for p in items
+    ]
 
 
 @app.get("/api/training-history")
@@ -247,27 +428,104 @@ def get_triangle_data(
 
 
 @app.get("/api/latest-readings")
-def get_latest_readings():
-    """Get the most recent temperature reading per unique coordinate."""
-    df = load_sst()
-    latest = df.sort_values("time").groupby(["latitude", "longitude"]).last().reset_index()
-    return latest.to_dict(orient="records")
+def get_latest_readings(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Get the most recent temperature reading per sensor coordinate."""
+    latest_subq = (
+        db.query(
+            SensorReading.sensor_id.label("sensor_id"),
+            func.max(SensorReading.timestamp).label("max_ts"),
+        )
+        .group_by(SensorReading.sensor_id)
+        .subquery()
+    )
+
+    rows = (
+        db.query(
+            Sensor.id.label("sensor_id"),
+            Sensor.sensor_uid.label("sensor_uid"),
+            Sensor.network_group_id.label("network_group_id"),
+            Sensor.latitude.label("latitude"),
+            Sensor.longitude.label("longitude"),
+            SensorReading.timestamp.label("time"),
+            SensorReading.temperature.label("temperature"),
+        )
+        .join(latest_subq, latest_subq.c.sensor_id == Sensor.id)
+        .join(
+            SensorReading,
+            (SensorReading.sensor_id == latest_subq.c.sensor_id)
+            & (SensorReading.timestamp == latest_subq.c.max_ts),
+        )
+        .filter(Sensor.latitude.isnot(None), Sensor.longitude.isnot(None))
+    )
+    if current_user.role != UserRole.admin:
+        network_ids = _user_network_ids(db, current_user)
+        if not network_ids:
+            return []
+        rows = rows.filter(Sensor.network_group_id.in_(network_ids))
+    rows = rows.all()
+
+    return [
+        {
+            "sensor_id": r.sensor_id,
+            "sensor_uid": r.sensor_uid,
+            "network_group_id": r.network_group_id,
+            "time": r.time.isoformat(),
+            "latitude": r.latitude,
+            "longitude": r.longitude,
+            "temperature": r.temperature,
+        }
+        for r in rows
+    ]
 
 
 @app.get("/api/risk-summary")
-def get_risk_summary():
-    """Get risk level distribution from predictions."""
-    df = load_predictions()
-    summary = {
-        "total_points": len(df),
-        "healthy": int((df["risk_level"] == 0).sum()),
-        "warning": int((df["risk_level"] == 1).sum()),
-        "danger": int((df["risk_level"] == 2).sum()),
-        "avg_temperature": round(float(df["temperature"].mean()), 2),
-        "max_temperature": round(float(df["temperature"].max()), 2),
-        "avg_risk_score": round(float(df["risk_score"].mean()), 4),
+def get_risk_summary(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Get risk level distribution from stored predictions."""
+    base = db.query(Prediction)
+    if current_user.role != UserRole.admin:
+        network_ids = _user_network_ids(db, current_user)
+        if not network_ids:
+            return {
+                "total_points": 0,
+                "healthy": 0,
+                "warning": 0,
+                "danger": 0,
+                "avg_temperature": None,
+                "max_temperature": None,
+                "avg_risk_score": None,
+            }
+        base = (
+            base.join(Sensor, Sensor.id == Prediction.sensor_id)
+            .filter(Sensor.network_group_id.in_(network_ids))
+        )
+
+    total = base.with_entities(func.count(Prediction.id)).scalar() or 0
+    healthy = base.filter(Prediction.risk_level == 0).with_entities(func.count(Prediction.id)).scalar() or 0
+    warning = base.filter(Prediction.risk_level == 1).with_entities(func.count(Prediction.id)).scalar() or 0
+    danger = base.filter(Prediction.risk_level == 2).with_entities(func.count(Prediction.id)).scalar() or 0
+    avg_temp = base.with_entities(func.avg(Prediction.predicted_temp)).scalar()
+    max_temp = base.with_entities(func.max(Prediction.predicted_temp)).scalar()
+    avg_risk = (
+        base.filter(Prediction.risk_score.isnot(None))
+        .with_entities(func.avg(Prediction.risk_score))
+        .scalar()
+    )
+
+    return {
+        "total_points": int(total),
+        "healthy": int(healthy),
+        "warning": int(warning),
+        "danger": int(danger),
+        "avg_temperature": round(float(avg_temp), 2) if avg_temp is not None else None,
+        "max_temperature": round(float(max_temp), 2) if max_temp is not None else None,
+        "avg_risk_score": round(float(avg_risk), 4) if avg_risk is not None else None,
     }
-    return summary
 
 
 # ─── Auth Routes ──────────────────────────────────────────────────────────────
@@ -285,6 +543,18 @@ def register(payload: UserCreate, db: Session = Depends(get_db)):
     db.add(user)
     db.commit()
     db.refresh(user)
+    # create the default network group and membership
+    ngid = f"ng_{uuid.uuid4().hex[:12]}"
+    if ngid:
+        if not db.query(NetworkGroup).filter(NetworkGroup.id == ngid).first():
+            db.add(NetworkGroup(id=ngid, name=None))
+            db.commit()
+        if not db.query(UserNetworkGroup).filter(
+            UserNetworkGroup.user_id == user.id,
+            UserNetworkGroup.network_group_id == ngid,
+        ).first():
+            db.add(UserNetworkGroup(user_id=user.id, network_group_id=ngid))
+            db.commit()
     return user
 
 
@@ -317,6 +587,7 @@ class SensorOut(BaseModel):
     id: int
     sensor_uid: str
     owner_id: Optional[int]
+    network_group_id: Optional[str]
     latitude: Optional[float]
     longitude: Optional[float]
     depth: Optional[float]
@@ -344,11 +615,14 @@ def get_sensors(
     """
     Return sensors scoped to the caller's role:
     - admin  → all sensors
-    - user   → only sensors owned by this user
+    - user   → only sensors in user's network group
     """
     if current_user.role == UserRole.admin:
         return db.query(Sensor).all()
-    return db.query(Sensor).filter(Sensor.owner_id == current_user.id).all()
+    network_ids = _user_network_ids(db, current_user)
+    if not network_ids:
+        return []
+    return db.query(Sensor).filter(Sensor.network_group_id.in_(network_ids)).all()
 
 
 @app.post("/admin/register-sensor", response_model=SensorOut, status_code=status.HTTP_201_CREATED)
@@ -371,11 +645,21 @@ def admin_register_sensor(
     sensor = Sensor(
         sensor_uid=payload.sensor_id,
         owner_id=owner.id,
+        network_group_id=(
+            db.query(UserNetworkGroup.network_group_id)
+            .filter(UserNetworkGroup.user_id == owner.id)
+            .order_by(UserNetworkGroup.created_at.asc())
+            .first()[0]
+            if db.query(UserNetworkGroup).filter(UserNetworkGroup.user_id == owner.id).first()
+            else None
+        ),
         latitude=payload.latitude,
         longitude=payload.longitude,
         depth=payload.depth,
         is_approved=True,
     )
+    if not sensor.network_group_id:
+        raise HTTPException(status_code=400, detail="Owner has no network group membership")
     db.add(sensor)
     db.commit()
     db.refresh(sensor)
@@ -417,7 +701,13 @@ async def ws_alerts(websocket: WebSocket, token: str = Query(...)):
     finally:
         db.close()
 
-    await manager.connect(websocket, user)
+    db2 = SessionLocal()
+    try:
+        network_ids = _user_network_ids(db2, user) if user.role != UserRole.admin else []
+    finally:
+        db2.close()
+
+    await manager.connect(websocket, user, network_ids)
     try:
         while True:
             await websocket.receive_text()  # keep-alive; ignore client messages
@@ -493,7 +783,7 @@ async def ingest_reading(
             "risk_level": 2,
             "timestamp": ts.isoformat(),
         }
-        await manager.broadcast_alert(alert, sensor.owner_id)
+        await manager.broadcast_alert(alert, sensor.network_group_id)
 
     return SensorDataResponse(
         sensor_id=sensor.id,
@@ -526,8 +816,10 @@ def get_sensor_readings(
     sensor = db.query(Sensor).filter(Sensor.id == sensor_id).first()
     if not sensor:
         raise HTTPException(status_code=404, detail="Sensor not found")
-    if current_user.role != UserRole.admin and sensor.owner_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Access denied")
+    if current_user.role != UserRole.admin:
+        network_ids = _user_network_ids(db, current_user)
+        if not network_ids or sensor.network_group_id not in network_ids:
+            raise HTTPException(status_code=403, detail="Access denied")
 
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
     return (
@@ -566,8 +858,10 @@ def get_sensor_forecast(
     sensor = db.query(Sensor).filter(Sensor.id == sensor_id).first()
     if not sensor:
         raise HTTPException(status_code=404, detail="Sensor not found")
-    if current_user.role != UserRole.admin and sensor.owner_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Access denied")
+    if current_user.role != UserRole.admin:
+        network_ids = _user_network_ids(db, current_user)
+        if not network_ids or sensor.network_group_id not in network_ids:
+            raise HTTPException(status_code=403, detail="Access denied")
 
     return (
         db.query(Prediction)
