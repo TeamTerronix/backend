@@ -132,9 +132,12 @@ for _o in _extra.split(","):
     if _o and _o not in _cors_origins:
         _cors_origins.append(_o)
 
+_cors_origin_regex = os.getenv("CORS_ORIGIN_REGEX", "").strip() or None
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
+    allow_origin_regex=_cors_origin_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
