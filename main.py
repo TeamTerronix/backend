@@ -12,6 +12,7 @@ import pandas as pd
 import uuid
 
 from fastapi import Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, status
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, field_validator
@@ -912,6 +913,20 @@ class SensorDataResponse(BaseModel):
     timestamp: datetime
     temperature: float
     status: str                # "created" or "duplicate_skipped"
+
+
+@app.get("/ws/alerts")
+async def ws_alerts_http_only():
+    """
+    Plain HTTP GET hits this route (no Upgrade: websocket). Real clients must use WebSocket.
+    Avoids a misleading 404 in access logs for mistaken HTTP requests.
+    """
+    return JSONResponse(
+        status_code=status.HTTP_426_UPGRADE_REQUIRED,
+        content={
+            "detail": "Use a WebSocket client with Connection: Upgrade (see /ws/alerts WebSocket route).",
+        },
+    )
 
 
 @app.websocket("/ws/alerts")
