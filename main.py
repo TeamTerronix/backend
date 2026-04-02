@@ -14,7 +14,7 @@ import uuid
 from fastapi import Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
@@ -81,6 +81,25 @@ def _user_network_ids(db: Session, user: User) -> list[str]:
         .all()
     )
     return [r[0] for r in rows if r and r[0]]
+
+
+def _membership_network_ids_for_user_id(db: Session, user_id: int) -> list[str]:
+    rows = (
+        db.query(UserNetworkGroup.network_group_id)
+        .filter(UserNetworkGroup.user_id == user_id)
+        .all()
+    )
+    return [r[0] for r in rows if r and r[0]]
+
+
+def _first_network_group_id_for_user(db: Session, user_id: int) -> Optional[str]:
+    row = (
+        db.query(UserNetworkGroup.network_group_id)
+        .filter(UserNetworkGroup.user_id == user_id)
+        .order_by(UserNetworkGroup.created_at.asc())
+        .first()
+    )
+    return row[0] if row else None
 
 
 # ── Lifespan: start/stop the background scheduler ─────────────────────────────
@@ -481,6 +500,69 @@ def get_latest_readings(
     ]
 
 
+class NetworkGroupOut(BaseModel):
+    id: str
+    name: Optional[str] = None
+    center_lat: Optional[float] = None
+    center_lon: Optional[float] = None
+
+
+def _network_groups_to_out(db: Session, groups: List[NetworkGroup]) -> List[NetworkGroupOut]:
+    if not groups:
+        return []
+    gid_list = [g.id for g in groups]
+    center_rows = (
+        db.query(
+            Sensor.network_group_id,
+            func.avg(Sensor.latitude),
+            func.avg(Sensor.longitude),
+        )
+        .filter(Sensor.network_group_id.in_(gid_list))
+        .group_by(Sensor.network_group_id)
+        .all()
+    )
+    cent_map: dict[str, tuple[Optional[float], Optional[float]]] = {
+        row[0]: (float(row[1]) if row[1] is not None else None, float(row[2]) if row[2] is not None else None)
+        for row in center_rows
+    }
+    return [
+        NetworkGroupOut(
+            id=g.id,
+            name=g.name,
+            center_lat=cent_map.get(g.id, (None, None))[0],
+            center_lon=cent_map.get(g.id, (None, None))[1],
+        )
+        for g in groups
+    ]
+
+
+@app.get("/api/network-groups", response_model=List[NetworkGroupOut])
+def list_network_groups(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Network groups visible to the caller:
+    - admin → all groups in the database
+    - user  → only groups the user is a member of
+    """
+    if current_user.role == UserRole.admin:
+        groups = db.query(NetworkGroup).order_by(NetworkGroup.id.asc()).all()
+    else:
+        ids = _user_network_ids(db, current_user)
+        if not ids:
+            return []
+        groups = (
+            db.query(NetworkGroup)
+            .filter(NetworkGroup.id.in_(ids))
+            .order_by(NetworkGroup.id.asc())
+            .all()
+        )
+    if not groups:
+        return []
+    return _network_groups_to_out(db, groups)
+
+
 @app.get("/api/risk-summary")
 def get_risk_summary(
     current_user: User = Depends(get_current_user),
@@ -581,6 +663,109 @@ def me(current_user: User = Depends(get_current_user)):
     return current_user
 
 
+# ─── Admin provisioning (users & networks) ────────────────────────────────────
+
+
+class AdminCreateUserRequest(BaseModel):
+    email: str
+    password: str
+
+
+class AdminUserListItem(BaseModel):
+    id: int
+    email: str
+    role: UserRole
+
+    class Config:
+        from_attributes = True
+
+
+class AdminCreateNetworkGroupRequest(BaseModel):
+    name: Optional[str] = None
+    user_email: str
+
+
+@app.post("/admin/users", response_model=UserOut, status_code=status.HTTP_201_CREATED)
+def admin_create_user(
+    payload: AdminCreateUserRequest,
+    admin: User = Depends(get_admin_user),
+    db: Session = Depends(get_db),
+):
+    """Admin-only: create a user account with a default empty network group; admin is added to that network too."""
+    if db.query(User).filter(User.email == payload.email).first():
+        raise HTTPException(status_code=400, detail="Email already registered")
+    user = User(
+        email=payload.email,
+        hashed_password=hash_password(payload.password),
+        role=UserRole.user,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    ngid = f"ng_{uuid.uuid4().hex[:12]}"
+    if not db.query(NetworkGroup).filter(NetworkGroup.id == ngid).first():
+        db.add(NetworkGroup(id=ngid, name=None))
+        db.commit()
+    db.add(UserNetworkGroup(user_id=user.id, network_group_id=ngid))
+    db.add(UserNetworkGroup(user_id=admin.id, network_group_id=ngid))
+    db.commit()
+    return user
+
+
+@app.get("/admin/users", response_model=List[AdminUserListItem])
+def admin_list_users(
+    admin: User = Depends(get_admin_user),
+    db: Session = Depends(get_db),
+):
+    """Admin-only: list all users (for provisioning UI)."""
+    return db.query(User).order_by(User.id.asc()).all()
+
+
+@app.post("/admin/network-groups", response_model=NetworkGroupOut)
+def admin_create_network_group(
+    payload: AdminCreateNetworkGroupRequest,
+    admin: User = Depends(get_admin_user),
+    db: Session = Depends(get_db),
+):
+    """Admin-only: create a new node network, attach it to the user, and add the creating admin as a member."""
+    owner = db.query(User).filter(User.email == payload.user_email).first()
+    if not owner:
+        raise HTTPException(status_code=404, detail=f"User '{payload.user_email}' not found")
+    ngid = f"ng_{uuid.uuid4().hex[:12]}"
+    if db.query(NetworkGroup).filter(NetworkGroup.id == ngid).first():
+        raise HTTPException(status_code=500, detail="Network id collision — retry")
+    db.add(NetworkGroup(id=ngid, name=payload.name))
+    db.add(UserNetworkGroup(user_id=owner.id, network_group_id=ngid))
+    # So the admin account also sees this network in the dashboard / API scoping (unless admin is the owner).
+    if admin.id != owner.id:
+        db.add(UserNetworkGroup(user_id=admin.id, network_group_id=ngid))
+    db.commit()
+    ng = db.query(NetworkGroup).filter(NetworkGroup.id == ngid).first()
+    if ng is None:
+        raise HTTPException(status_code=500, detail="Failed to create network group")
+    return _network_groups_to_out(db, [ng])[0]
+
+
+@app.get("/admin/user-network-groups", response_model=List[NetworkGroupOut])
+def admin_user_network_groups(
+    user_email: str = Query(..., description="User email"),
+    admin: User = Depends(get_admin_user),
+    db: Session = Depends(get_db),
+):
+    """Admin-only: list node networks a user belongs to (oldest membership first — matches default sensor routing)."""
+    owner = db.query(User).filter(User.email == user_email).first()
+    if not owner:
+        raise HTTPException(status_code=404, detail=f"User '{user_email}' not found")
+    groups = (
+        db.query(NetworkGroup)
+        .join(UserNetworkGroup, UserNetworkGroup.network_group_id == NetworkGroup.id)
+        .filter(UserNetworkGroup.user_id == owner.id)
+        .order_by(UserNetworkGroup.created_at.asc())
+        .all()
+    )
+    return _network_groups_to_out(db, groups)
+
+
 # ─── Sensor Pydantic Schemas ──────────────────────────────────────────────────
 
 class SensorOut(BaseModel):
@@ -603,6 +788,24 @@ class RegisterSensorRequest(BaseModel):
     latitude: float
     longitude: float
     depth: float
+    network_group_id: Optional[str] = None
+
+    @field_validator("sensor_id", "owner_email", mode="before")
+    @classmethod
+    def strip_required_strings(cls, v: object) -> object:
+        if isinstance(v, str):
+            return v.strip()
+        return v
+
+    @field_validator("network_group_id", mode="before")
+    @classmethod
+    def empty_network_to_none(cls, v: object) -> object:
+        if v is None:
+            return None
+        if isinstance(v, str):
+            s = v.strip()
+            return s if s else None
+        return v
 
 
 # ─── Sensor Routes ────────────────────────────────────────────────────────────
@@ -642,24 +845,44 @@ def admin_register_sensor(
     if db.query(Sensor).filter(Sensor.sensor_uid == payload.sensor_id).first():
         raise HTTPException(status_code=400, detail="sensor_id already registered")
 
+    membership_ids = _membership_network_ids_for_user_id(db, owner.id)
+
+    ng_id: Optional[str] = None
+    if payload.network_group_id:
+        ng = db.query(NetworkGroup).filter(NetworkGroup.id == payload.network_group_id).first()
+        if not ng:
+            raise HTTPException(status_code=404, detail="Network group not found")
+        membership = db.query(UserNetworkGroup).filter(
+            UserNetworkGroup.user_id == owner.id,
+            UserNetworkGroup.network_group_id == payload.network_group_id,
+        ).first()
+        if not membership:
+            try:
+                db.add(UserNetworkGroup(user_id=owner.id, network_group_id=payload.network_group_id))
+                db.commit()
+            except IntegrityError:
+                db.rollback()
+        ng_id = payload.network_group_id
+    else:
+        if len(membership_ids) > 1:
+            raise HTTPException(
+                status_code=400,
+                detail="Owner belongs to multiple node networks; send network_group_id to choose one.",
+            )
+        ng_id = _first_network_group_id_for_user(db, owner.id)
+
+    if not ng_id:
+        raise HTTPException(status_code=400, detail="Owner has no network group membership")
+
     sensor = Sensor(
         sensor_uid=payload.sensor_id,
         owner_id=owner.id,
-        network_group_id=(
-            db.query(UserNetworkGroup.network_group_id)
-            .filter(UserNetworkGroup.user_id == owner.id)
-            .order_by(UserNetworkGroup.created_at.asc())
-            .first()[0]
-            if db.query(UserNetworkGroup).filter(UserNetworkGroup.user_id == owner.id).first()
-            else None
-        ),
+        network_group_id=ng_id,
         latitude=payload.latitude,
         longitude=payload.longitude,
         depth=payload.depth,
         is_approved=True,
     )
-    if not sensor.network_group_id:
-        raise HTTPException(status_code=400, detail="Owner has no network group membership")
     db.add(sensor)
     db.commit()
     db.refresh(sensor)
