@@ -14,6 +14,13 @@ On EC2 / production, put DATABASE_URL (PostgreSQL / RDS) in backend/.env so rows
 Optional:
 
   python provision_prototype.py --sensor-uid "1" --user-email prototype@sliot.local --user-password proto123
+
+If login fails with "Incorrect email or password" for prototype@sliot.local, the account may have
+existed already (password was not changed). Either run:
+
+  python provision_prototype.py --reset-password --user-password proto123
+
+or use --update-password together with --sensor-uid on a fresh sensor id.
 """
 
 from __future__ import annotations
@@ -53,16 +60,42 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Provision prototype user + network + sensor")
     parser.add_argument(
         "--sensor-uid",
-        required=True,
-        help="sensor_uid for POST /data (e.g. 1 to match numeric node id in firmware)",
+        required=False,
+        help="sensor_uid for POST /data (required unless --reset-password)",
     )
     parser.add_argument("--user-email", default="prototype@sliot.local")
     parser.add_argument("--user-password", default="proto123")
+    parser.add_argument(
+        "--update-password",
+        action="store_true",
+        help="If the user already exists, set their password to --user-password (default: proto123).",
+    )
+    parser.add_argument(
+        "--reset-password",
+        action="store_true",
+        help="Only update password for --user-email and exit (no network/sensor). Use when login fails.",
+    )
     parser.add_argument("--network-name", default="Prototype network")
     parser.add_argument("--latitude", type=float, default=8.88)
     parser.add_argument("--longitude", type=float, default=79.525)
     parser.add_argument("--depth", type=float, default=4.0)
     args = parser.parse_args()
+
+    if args.reset_password:
+        Base.metadata.create_all(bind=engine)
+        print(f"Database: {DATABASE_URL}")
+        db = SessionLocal()
+        try:
+            user = db.query(User).filter(User.email == args.user_email).first()
+            if not user:
+                print(f"No user with email {args.user_email!r}.")
+                return 1
+            user.hashed_password = hash_password(args.user_password)
+            db.commit()
+            print(f"Updated password for {args.user_email}")
+            return 0
+        finally:
+            db.close()
 
     sensor_uid = args.sensor_uid.strip()
     if not sensor_uid:
@@ -97,6 +130,11 @@ def main() -> int:
             print(f"Created user: {user.email}")
         else:
             print(f"Using existing user: {user.email}")
+            if args.update_password:
+                user.hashed_password = hash_password(args.user_password)
+                db.commit()
+                db.refresh(user)
+                print(f"Updated password for {user.email}")
 
         ngid = f"ng_{uuid.uuid4().hex[:12]}"
         if db.query(NetworkGroup).filter(NetworkGroup.id == ngid).first():
