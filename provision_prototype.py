@@ -9,6 +9,8 @@ Usage:
 
   python provision_prototype.py --sensor-uid "1"
 
+On EC2 / production, put DATABASE_URL (PostgreSQL / RDS) in backend/.env so rows are created there, not in local SQLite.
+
 Optional:
 
   python provision_prototype.py --sensor-uid "1" --user-email prototype@sliot.local --user-password proto123
@@ -20,12 +22,6 @@ import argparse
 import os
 import pathlib
 import uuid
-
-from sqlalchemy.exc import IntegrityError
-
-from auth import hash_password
-from database import SessionLocal, engine
-from models import Base, NetworkGroup, Sensor, User, UserNetworkGroup, UserRole
 
 
 def _load_env_file_if_needed() -> None:
@@ -46,7 +42,11 @@ def _load_env_file_if_needed() -> None:
 
 _load_env_file_if_needed()
 
-from database import DATABASE_URL  # noqa: E402
+from sqlalchemy.exc import IntegrityError
+
+from auth import hash_password
+from database import DATABASE_URL, SessionLocal, engine
+from models import Base, NetworkGroup, Sensor, User, UserNetworkGroup, UserRole
 
 
 def main() -> int:
@@ -71,6 +71,11 @@ def main() -> int:
 
     Base.metadata.create_all(bind=engine)
     print(f"Database: {DATABASE_URL}")
+    if DATABASE_URL.startswith("sqlite"):
+        print(
+            "Note: using SQLite (local file). For RDS/PostgreSQL, set DATABASE_URL in backend/.env "
+            "and run again."
+        )
 
     db = SessionLocal()
     try:
