@@ -15,7 +15,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, WebSocket, WebSocket
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
@@ -904,8 +904,11 @@ def admin_register_sensor(
 
 class SensorDataPayload(BaseModel):
     sensor_uid: str
-    timestamp: datetime        # ISO-8601; will be floored to the nearest hour
     temperature: float
+    timestamp: Optional[datetime] = Field(
+        default=None,
+        description="ISO-8601 time, floored to the hour (UTC). Omit to use server time.",
+    )
 
 
 class SensorDataResponse(BaseModel):
@@ -976,6 +979,9 @@ async def ingest_reading(
     The timestamp is floored to the hour boundary.  If a reading already
     exists for that sensor × hour pair, the request is acknowledged but
     no duplicate is inserted (idempotent).
+
+    If ``timestamp`` is omitted, the server uses the current UTC time (for devices
+    that cannot send a clock).
     """
     sensor = db.query(Sensor).filter(Sensor.sensor_uid == payload.sensor_uid).first()
     if not sensor:
@@ -983,8 +989,9 @@ async def ingest_reading(
     if not sensor.is_approved:
         raise HTTPException(status_code=403, detail="Sensor is not approved")
 
+    raw_ts = payload.timestamp if payload.timestamp is not None else datetime.now(timezone.utc)
     # Floor to the nearest hour (UTC)
-    ts = payload.timestamp.replace(minute=0, second=0, microsecond=0)
+    ts = raw_ts.replace(minute=0, second=0, microsecond=0)
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)
 

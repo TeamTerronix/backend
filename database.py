@@ -3,7 +3,8 @@ database.py
 ===========
 SQLAlchemy engine, session factory, and Base declaration.
 
-Set DATABASE_URL in your environment (or .env file) before running.
+Set DATABASE_URL in your environment (or .env file) before importing this module
+(or run scripts like provision_prototype.py that load .env first).
 Example (PostgreSQL):
     DATABASE_URL=postgresql+psycopg://user:password@localhost:5432/sliot
 

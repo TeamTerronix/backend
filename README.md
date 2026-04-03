@@ -66,6 +66,8 @@ Update `.env` values as needed:
 - `ALGORITHM`
 - `ACCESS_TOKEN_EXPIRE_MINUTES`
 
+On a server (EC2), set `DATABASE_URL` to your **PostgreSQL / RDS** URL before running scripts or `uvicorn`, or tools will default to **local SQLite** (`./sliot.db`) and you will not see data in RDS.
+
 ### Database options
 
 - SQLite (default, easiest local setup):
@@ -96,6 +98,38 @@ If you want test users/sensors/readings/predictions in your PostgreSQL DB for da
 ```bash
 python seed_data.py
 ```
+
+## 5c. Prototype sensor + user (ESP32 / field devices)
+
+Registers one dashboard user, one network, and one **approved** sensor so devices can `POST /data`.
+
+```bash
+python provision_prototype.py --sensor-uid "1"
+```
+
+Defaults: `prototype@sliot.local` / `proto123`. If login fails for an **existing** user, reset the password:
+
+```bash
+python provision_prototype.py --reset-password --user-password proto123
+```
+
+`provision_prototype.py` loads `backend/.env` **before** connecting, so `DATABASE_URL` in `.env` applies to provisioning.
+
+## 5d. Sensor ingest (`POST /data`)
+
+Devices send JSON to **`POST /data`** (no JWT). The body must include `sensor_uid` and `temperature`. `timestamp` is **optional**; if omitted, the server uses current UTC (hour-bucketed for deduplication).
+
+Example:
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8000/data" \
+  -H "Content-Type: application/json" \
+  -d '{"sensor_uid":"1","temperature":29.0}'
+```
+
+`sensor_uid` must match a **registered and approved** sensor (see `provision_prototype.py`). OpenAPI: `/docs` → `POST /data`.
+
+ESP32: `reciever_single_temp.ino` POSTs to `/data` with sensor id + temperature only; time is stored on the server.
 
 ## 6. Run the API
 

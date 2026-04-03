@@ -170,8 +170,9 @@ def main() -> int:
         print("")
         print("Example POST /data JSON:")
         print(
-            f'  {{"sensor_uid": "{sensor_uid}", "timestamp": "2026-04-02T12:00:00Z", "temperature": 29.0}}'
+            f'  {{"sensor_uid": "{sensor_uid}", "temperature": 29.0}}'
         )
+        print('  (optional: add "timestamp" ISO-8601; else server uses current UTC)')
         return 0
     finally:
         db.close()
