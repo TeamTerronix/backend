@@ -7,7 +7,10 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
+import logging
 import os
+import threading
+import time
 import pandas as pd
 import uuid
 
@@ -36,9 +39,34 @@ from models import Prediction, Sensor, SensorReading, User, UserRole, NetworkGro
 from scheduler import create_scheduler
 
 
+logger = logging.getLogger(__name__)
+
 # ── WebSocket Alert Manager ────────────────────────────────────────────────────
 
 BLEACHING_THRESHOLD = 31.0
+
+# Throttle background PINN runs triggered by POST /data (full job processes all sensors)
+_forecast_after_reading_last = 0.0
+_FORECAST_AFTER_READING_COOLDOWN_SEC = 45.0
+
+
+def _schedule_forecast_job_after_reading() -> None:
+    """Run the 6h forecast job soon after new data (throttled; same logic as scheduler)."""
+    global _forecast_after_reading_last
+    now = time.time()
+    if now - _forecast_after_reading_last < _FORECAST_AFTER_READING_COOLDOWN_SEC:
+        return
+    _forecast_after_reading_last = now
+
+    def _run() -> None:
+        try:
+            from scheduler import run_forecast_job  # noqa: PLC0415
+
+            run_forecast_job()
+        except Exception as exc:
+            logger.exception("Background forecast after reading failed: %s", exc)
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 class AlertConnectionManager:
@@ -57,17 +85,21 @@ class AlertConnectionManager:
     def disconnect(self, ws: WebSocket) -> None:
         self._connections.pop(ws, None)
 
-    async def broadcast_alert(self, alert: dict, network_group_id: Optional[str]) -> None:
-        """Send alert to all users in the network group and all admins."""
+    async def broadcast_json(self, message: dict, network_group_id: Optional[str]) -> None:
+        """Send JSON to admins and to users whose membership includes ``network_group_id``."""
         dead: list[WebSocket] = []
         for ws, (uid, role, network_ids) in self._connections.items():
             if role == "admin" or (network_group_id is not None and network_group_id in network_ids):
                 try:
-                    await ws.send_json(alert)
+                    await ws.send_json(message)
                 except Exception:
                     dead.append(ws)
         for ws in dead:
             self._connections.pop(ws, None)
+
+    async def broadcast_alert(self, alert: dict, network_group_id: Optional[str]) -> None:
+        """Send bleaching alert to all users in the network group and all admins."""
+        await self.broadcast_json(alert, network_group_id)
 
 
 manager = AlertConnectionManager()
@@ -1015,6 +1047,20 @@ async def ingest_reading(
             "timestamp": reading.timestamp.isoformat(),
         }
         await manager.broadcast_alert(alert, sensor.network_group_id)
+
+    await manager.broadcast_json(
+        {
+            "type": "reading_new",
+            "sensor_id": sensor.id,
+            "sensor_uid": sensor.sensor_uid,
+            "temperature": round(payload.temperature, 3),
+            "timestamp": reading.timestamp.isoformat(),
+            "network_group_id": sensor.network_group_id,
+        },
+        sensor.network_group_id,
+    )
+
+    _schedule_forecast_job_after_reading()
 
     return SensorDataResponse(
         sensor_id=sensor.id,
