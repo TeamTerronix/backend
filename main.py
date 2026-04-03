@@ -225,6 +225,10 @@ class StatsResponse(BaseModel):
     total_predictions: int
     date_range: dict
     unique_coordinates: int
+    # KPIs: aggregates over the last 24 hours (all sensors the user can see)
+    avg_temperature_24h: Optional[float] = None
+    max_temperature_24h: Optional[float] = None
+    readings_count_24h: int = 0
 
 
 # ─── Routes ───
@@ -235,6 +239,34 @@ def health():
         status="ok",
         version="1.0.0",
         timestamp=datetime.utcnow().isoformat(),
+    )
+
+
+def _reading_stats_last_24h(
+    db: Session, network_ids: Optional[list[str]]
+) -> tuple[Optional[float], Optional[float], int]:
+    """Average, max, and count of sensor_readings in the last 24h (scoped to networks if set)."""
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+    q = (
+        db.query(
+            func.avg(SensorReading.temperature),
+            func.max(SensorReading.temperature),
+            func.count(SensorReading.id),
+        )
+        .join(Sensor, Sensor.id == SensorReading.sensor_id)
+        .filter(SensorReading.timestamp >= cutoff)
+    )
+    if network_ids is not None:
+        q = q.filter(Sensor.network_group_id.in_(network_ids))
+    row = q.one()
+    avg, mx, cnt = row[0], row[1], row[2]
+    c = int(cnt or 0)
+    if c == 0:
+        return None, None, 0
+    return (
+        float(avg) if avg is not None else None,
+        float(mx) if mx is not None else None,
+        c,
     )
 
 
@@ -249,6 +281,8 @@ def get_stats(
     Notes:
     - total_dhw_records is kept for backward compatibility with the frontend but
       is not stored in the DB currently.
+    - avg_temperature_24h / max_temperature_24h / readings_count_24h aggregate
+      live readings in the rolling last 24 hours (not "one row per sensor").
     """
     if current_user.role == UserRole.admin:
         readings_count = db.query(func.count(SensorReading.id)).scalar() or 0
@@ -268,6 +302,7 @@ def get_stats(
             .scalar()
             or 0
         )
+        avg24, max24, cnt24 = _reading_stats_last_24h(db, None)
     else:
         network_ids = _user_network_ids(db, current_user)
         if not network_ids:
@@ -277,6 +312,9 @@ def get_stats(
                 total_predictions=0,
                 date_range={"start": None, "end": None},
                 unique_coordinates=0,
+                avg_temperature_24h=None,
+                max_temperature_24h=None,
+                readings_count_24h=0,
             )
 
         readings_count = (
@@ -314,6 +352,7 @@ def get_stats(
             .scalar()
             or 0
         )
+        avg24, max24, cnt24 = _reading_stats_last_24h(db, network_ids)
 
     return StatsResponse(
         total_sst_records=int(readings_count),
@@ -324,6 +363,9 @@ def get_stats(
             "end": max_ts.isoformat() if max_ts else None,
         },
         unique_coordinates=int(unique_coords),
+        avg_temperature_24h=avg24,
+        max_temperature_24h=max24,
+        readings_count_24h=cnt24,
     )
 
 
