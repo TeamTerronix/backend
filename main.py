@@ -907,7 +907,7 @@ class SensorDataPayload(BaseModel):
     temperature: float
     timestamp: Optional[datetime] = Field(
         default=None,
-        description="ISO-8601 time, floored to the hour (UTC). Omit to use server time.",
+        description="ISO-8601 time (UTC). Omit to use server receive time (full resolution).",
     )
 
 
@@ -915,7 +915,7 @@ class SensorDataResponse(BaseModel):
     sensor_id: int
     timestamp: datetime
     temperature: float
-    status: str                # "created" or "duplicate_skipped"
+    status: str = "created"
 
 
 @app.get("/ws/alerts")
@@ -974,14 +974,8 @@ async def ingest_reading(
     """
     Endpoint for sensors to POST live readings.
 
-    Hourly deduplication
-    --------------------
-    The timestamp is floored to the hour boundary.  If a reading already
-    exists for that sensor × hour pair, the request is acknowledged but
-    no duplicate is inserted (idempotent).
-
-    If ``timestamp`` is omitted, the server uses the current UTC time (for devices
-    that cannot send a clock).
+    Each request inserts one row in ``sensor_readings`` (no hourly deduplication).
+    If ``timestamp`` is omitted, the server uses the current UTC time with full resolution.
     """
     sensor = db.query(Sensor).filter(Sensor.sensor_uid == payload.sensor_uid).first()
     if not sensor:
@@ -989,25 +983,9 @@ async def ingest_reading(
     if not sensor.is_approved:
         raise HTTPException(status_code=403, detail="Sensor is not approved")
 
-    raw_ts = payload.timestamp if payload.timestamp is not None else datetime.now(timezone.utc)
-    # Floor to the nearest hour (UTC)
-    ts = raw_ts.replace(minute=0, second=0, microsecond=0)
+    ts = payload.timestamp if payload.timestamp is not None else datetime.now(timezone.utc)
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)
-
-    # Check for existing reading in this hour
-    existing = (
-        db.query(SensorReading)
-        .filter(SensorReading.sensor_id == sensor.id, SensorReading.timestamp == ts)
-        .first()
-    )
-    if existing:
-        return SensorDataResponse(
-            sensor_id=sensor.id,
-            timestamp=ts,
-            temperature=existing.temperature,
-            status="duplicate_skipped",
-        )
 
     reading = SensorReading(
         sensor_id=sensor.id,
@@ -1020,11 +998,9 @@ async def ingest_reading(
         db.refresh(reading)
     except IntegrityError:
         db.rollback()
-        return SensorDataResponse(
-            sensor_id=sensor.id,
-            timestamp=ts,
-            temperature=payload.temperature,
-            status="duplicate_skipped",
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Could not insert reading (if upgrading from hourly mode, run migrate_drop_sensor_readings_hourly_unique.py).",
         )
 
     # Broadcast bleaching alert to connected WS clients if threshold exceeded
@@ -1036,7 +1012,7 @@ async def ingest_reading(
             "location_name": sensor.sensor_uid,
             "temperature": round(payload.temperature, 2),
             "risk_level": 2,
-            "timestamp": ts.isoformat(),
+            "timestamp": reading.timestamp.isoformat(),
         }
         await manager.broadcast_alert(alert, sensor.network_group_id)
 

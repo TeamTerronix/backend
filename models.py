@@ -23,7 +23,6 @@ from sqlalchemy import (
     Enum,
     ForeignKey,
     DateTime,
-    UniqueConstraint,
 )
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -110,7 +109,7 @@ class Sensor(Base):
 
 
 class SensorReading(Base):
-    """One row per sensor per hour — the UniqueConstraint enforces hourly sampling."""
+    """Time-series readings: one row per POST /data (full-resolution timestamp)."""
     __tablename__ = "sensor_readings"
 
     id          = Column(Integer, primary_key=True, index=True)
@@ -120,10 +119,6 @@ class SensorReading(Base):
     created_at  = Column(DateTime(timezone=True), server_default=func.now())
 
     sensor = relationship("Sensor", back_populates="readings")
-
-    __table_args__ = (
-        UniqueConstraint("sensor_id", "timestamp", name="uq_sensor_hourly"),
-    )
 
     def __repr__(self) -> str:
         return f"<SensorReading sensor_id={self.sensor_id} ts={self.timestamp} temp={self.temperature}>"

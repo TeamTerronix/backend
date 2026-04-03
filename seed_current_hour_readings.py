@@ -1,7 +1,9 @@
 """
 Insert one sensor reading at the current UTC hour for every approved sensor.
 
-Matches the /data ingest behaviour: timestamp is floored to the hour. Skips
+Legacy helper: uses hour-floored timestamps for bulk seeding (live /data now stores every sample).
+
+Matches old hourly style: timestamp is floored to the hour. Skips
 if a reading already exists for that sensor × hour (idempotent).
 
 Usage (on EC2, from backend dir with .env pointing at your DB):

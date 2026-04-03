@@ -91,6 +91,12 @@ If you pull changes that add new columns (example: `network_group_id`), run:
 python migrate_add_network_group_id.py
 ```
 
+If ingest was changed from hourly to every sample, drop the old unique constraint:
+
+```bash
+python migrate_drop_sensor_readings_hourly_unique.py
+```
+
 ## 5a. (Optional) Seed the Database with Test Data
 
 If you want test users/sensors/readings/predictions in your PostgreSQL DB for dashboard testing:
@@ -117,7 +123,13 @@ python provision_prototype.py --reset-password --user-password proto123
 
 ## 5d. Sensor ingest (`POST /data`)
 
-Devices send JSON to **`POST /data`** (no JWT). The body must include `sensor_uid` and `temperature`. `timestamp` is **optional**; if omitted, the server uses current UTC (hour-bucketed for deduplication).
+Devices send JSON to **`POST /data`** (no JWT). The body must include `sensor_uid` and `temperature`. `timestamp` is **optional**; if omitted, the server uses current UTC. **Each POST inserts one row** in `sensor_readings` (no hourly deduplication).
+
+If you upgraded from an older DB that had hourly uniqueness, run once:
+
+```bash
+python migrate_drop_sensor_readings_hourly_unique.py
+```
 
 Example:
 
