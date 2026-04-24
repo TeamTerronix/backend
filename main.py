@@ -996,12 +996,12 @@ class SensorDataResponse(BaseModel):
 async def ws_alerts_http_only():
     """
     Plain HTTP GET hits this route (no Upgrade: websocket). Real clients must use WebSocket.
-    Avoids a misleading 404 in access logs for mistaken HTTP requests.
+    Returns 200 so random HTTP probes don't look like an error.
     """
     return JSONResponse(
-        status_code=status.HTTP_426_UPGRADE_REQUIRED,
+        status_code=status.HTTP_200_OK,
         content={
-            "detail": "Use a WebSocket client with Connection: Upgrade (see /ws/alerts WebSocket route).",
+            "detail": "This endpoint is a WebSocket. Connect with ws:// or wss:// to /ws/alerts?token=<jwt>.",
         },
     )
 
